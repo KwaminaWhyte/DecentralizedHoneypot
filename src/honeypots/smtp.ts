@@ -5,6 +5,20 @@ import { AlertService } from '../services/alerts/alertService';
 import { RateLimiter } from '../services/traffic/rateLimiter';
 import config from '../config';
 
+interface TrafficData {
+    protocol: string;
+    requestCount: number;
+    timeWindow: number;
+    uniqueIps: Set<string>;
+    sourceIp: string;
+    timestamp: number;
+    connectionCount: number;
+    authAttempts: number;
+    mailFrom: string;
+    rcptTo: string[];
+    messageSize?: number;
+}
+
 export class SmtpHoneypot {
     private server: SMTPServer;
     private predictor: AttackPredictor;
@@ -41,192 +55,210 @@ export class SmtpHoneypot {
     }
 
     private async handleConnection(session: any, callback: Function) {
-        const sourceIp = session.remoteAddress;
+        const ip = session.remoteAddress;
 
-        // Check if IP is blocked
-        if (this.blockedIPs.has(sourceIp)) {
-            return callback(new Error('Access Denied'));
+        if (this.blockedIPs.has(ip)) {
+            return callback(new Error('Connection refused'));
         }
 
-        // Check rate limit
-        if (this.rateLimiter.isRateLimited(sourceIp)) {
-            return callback(new Error('Too Many Requests'));
+        // Enhanced rate limiting
+        const rateLimit = await this.rateLimiter.checkLimit(ip, {
+            windowMs: 60000,
+            maxRequests: 50,
+            burstAllowance: 10,
+            burstDuration: 5000
+        });
+
+        if (!rateLimit.allowed) {
+            this.blockedIPs.add(ip);
+            setTimeout(() => this.blockedIPs.delete(ip), 300000); // 5-minute block
+            return callback(new Error('Too many connections'));
         }
 
-        try {
-            await this.logConnection(session);
-            callback(); // Accept the connection
-        } catch (error) {
-            console.error('Error handling SMTP connection:', error);
-            callback(new Error('Error processing connection'));
-        }
+        const data: TrafficData = {
+            protocol: 'smtp',
+            requestCount: 1,
+            timeWindow: 60000,
+            uniqueIps: new Set([ip]),
+            sourceIp: ip,
+            timestamp: Date.now(),
+            connectionCount: 1,
+            authAttempts: 0,
+            mailFrom: '',
+            rcptTo: []
+        };
+
+        this.logTraffic(data);
+        callback();
     }
 
-    private async handleMailFrom(from: any, session: any, callback: Function) {
-        try {
-            await this.logMailFrom(from, session);
-            
-            // Random delay to simulate processing
-            setTimeout(() => {
-                callback(); // Accept the sender
-            }, Math.random() * 1000);
-        } catch (error) {
-            console.error('Error handling MAIL FROM:', error);
-            callback(new Error('Error processing sender'));
+    private async handleMailFrom(address: string, session: any, callback: Function) {
+        const ip = session.remoteAddress;
+        
+        // Update traffic data
+        const data: TrafficData = {
+            protocol: 'smtp',
+            requestCount: 1,
+            timeWindow: 60000,
+            uniqueIps: new Set([ip]),
+            sourceIp: ip,
+            timestamp: Date.now(),
+            mailFrom: address,
+            rcptTo: [],
+            authAttempts: session.authAttempts || 0
+        };
+
+        this.logTraffic(data);
+
+        // Check for spam patterns
+        if (this.isSpamPattern(address)) {
+            this.alertService.emit('attack', {
+                type: 'spam',
+                confidence: 0.9,
+                sourceIp: ip,
+                timestamp: new Date(),
+                details: {
+                    mailFrom: address,
+                    indicators: ['suspicious_sender']
+                }
+            });
+            return callback(new Error('Sender rejected'));
         }
+
+        callback();
     }
 
-    private async handleRcptTo(to: any, session: any, callback: Function) {
-        try {
-            await this.logRcptTo(to, session);
-            
-            // Randomly reject some recipients to appear more realistic
-            if (Math.random() < 0.2) {
-                return callback(new Error('User not found'));
-            }
-            
-            callback(); // Accept the recipient
-        } catch (error) {
-            console.error('Error handling RCPT TO:', error);
-            callback(new Error('Error processing recipient'));
+    private async handleRcptTo(address: string, session: any, callback: Function) {
+        const ip = session.remoteAddress;
+        
+        // Update traffic data with recipient
+        const data: TrafficData = {
+            protocol: 'smtp',
+            requestCount: 1,
+            timeWindow: 60000,
+            uniqueIps: new Set([ip]),
+            sourceIp: ip,
+            timestamp: Date.now(),
+            mailFrom: session.envelope.mailFrom?.address || '',
+            rcptTo: [address],
+            authAttempts: session.authAttempts || 0
+        };
+
+        this.logTraffic(data);
+
+        // Check for recipient harvesting
+        if (this.isHarvestingAttempt(session)) {
+            this.alertService.emit('attack', {
+                type: 'harvesting',
+                confidence: 0.95,
+                sourceIp: ip,
+                timestamp: new Date(),
+                details: {
+                    rcptCount: session.rcptCount || 0,
+                    timeframe: Date.now() - (session.startTime || Date.now())
+                }
+            });
+            return callback(new Error('Recipient rejected'));
         }
+
+        callback();
     }
 
     private async handleData(stream: any, session: any, callback: Function) {
-        let messageData = '';
-        
+        const ip = session.remoteAddress;
+        let messageSize = 0;
+        let chunks: Buffer[] = [];
+
         stream.on('data', (chunk: Buffer) => {
-            messageData += chunk;
+            messageSize += chunk.length;
+            chunks.push(chunk);
+
+            // Check for message size limits
+            if (messageSize > 1024 * 1024) { // 1MB limit
+                stream.emit('error', new Error('Message too large'));
+            }
         });
 
         stream.on('end', async () => {
-            try {
-                await this.logMessageData(messageData, session);
-                
-                // Analyze recent traffic for potential attacks
-                const sourceIp = session.remoteAddress;
-                const recentTraffic = await TrafficLogModel.find({
-                    sourceIp,
-                    protocol: 'SMTP',
-                    timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
-                }).sort({ timestamp: -1 }).limit(100);
+            const message = Buffer.concat(chunks).toString();
+            
+            // Update traffic data with message details
+            const data: TrafficData = {
+                protocol: 'smtp',
+                requestCount: 1,
+                timeWindow: 60000,
+                uniqueIps: new Set([ip]),
+                sourceIp: ip,
+                timestamp: Date.now(),
+                mailFrom: session.envelope.mailFrom?.address || '',
+                rcptTo: session.envelope.rcptTo?.map((r: any) => r.address) || [],
+                messageSize,
+                authAttempts: session.authAttempts || 0
+            };
 
-                if (recentTraffic.length > 10) {
-                    const classification = await this.predictor.predictAttack(recentTraffic);
-                    
-                    if (classification.confidence > 0.7) {
-                        await this.alertService.raiseAlert({
-                            sourceIp,
-                            protocol: 'SMTP',
-                            attackType: classification.attackType,
-                            confidence: classification.confidence,
-                            details: classification.details.indicators || [],
-                            metrics: {
-                                requestCount: recentTraffic.length,
-                                burstCount: classification.details.burstCount || 0,
-                                averageInterval: classification.details.avgInterval || 0
-                            }
-                        });
+            this.logTraffic(data);
+
+            // Analyze message for attacks
+            const prediction = await this.predictor.predict(data);
+            
+            if (prediction.confidence > 0.85) {
+                this.alertService.emit('attack', {
+                    type: prediction.attackType,
+                    confidence: prediction.confidence,
+                    sourceIp: ip,
+                    timestamp: new Date(),
+                    details: {
+                        messageSize,
+                        mailFrom: session.envelope.mailFrom?.address,
+                        rcptCount: session.envelope.rcptTo?.length,
+                        headers: this.extractHeaders(message)
                     }
-                }
+                });
 
-                // Randomly generate different responses
-                const responses = [
-                    { success: true, message: 'Message queued for delivery' },
-                    { success: false, message: 'Temporary failure, please try again later' },
-                    { success: false, message: 'Mailbox full' },
-                    { success: false, message: 'Service temporarily unavailable' }
-                ];
-
-                const response = responses[Math.floor(Math.random() * responses.length)];
-                
-                if (response.success) {
-                    callback(null, 'Message accepted');
-                } else {
-                    callback(new Error(response.message));
+                if (prediction.attackType === 'spam' || prediction.attackType === 'malware') {
+                    this.blockedIPs.add(ip);
+                    return callback(new Error('Message rejected'));
                 }
-            } catch (error) {
-                console.error('Error handling message data:', error);
-                callback(new Error('Error processing message'));
             }
+
+            callback();
         });
     }
 
-    private async logConnection(session: any) {
-        const trafficLog = {
-            sourceIp: session.remoteAddress,
-            timestamp: new Date(),
-            protocol: 'SMTP' as const,
-            requestData: {
-                method: 'CONNECT',
-                headers: session.openingCommand || {},
-                payload: {
-                    clientHostname: session.clientHostname,
-                    transmissionType: session.transmissionType
-                }
-            }
-        };
+    private isSpamPattern(address: string): boolean {
+        const spamPatterns = [
+            /^(?!.*@(?:gmail|yahoo|hotmail|outlook)\.com$).+@.+$/i, // Non-standard domains
+            /\d{6,}@/i, // Many numbers in local part
+            /[a-z0-9]{12,}@/i // Very long local part
+        ];
 
-        await TrafficLogModel.create(trafficLog);
-        console.log(`SMTP Connection from ${trafficLog.sourceIp}`);
+        return spamPatterns.some(pattern => pattern.test(address));
     }
 
-    private async logMailFrom(from: any, session: any) {
-        const trafficLog = {
-            sourceIp: session.remoteAddress,
-            timestamp: new Date(),
-            protocol: 'SMTP' as const,
-            requestData: {
-                method: 'MAIL FROM',
-                headers: {},
-                payload: {
-                    from: from.address,
-                    args: from.args
-                }
-            }
-        };
-
-        await TrafficLogModel.create(trafficLog);
+    private isHarvestingAttempt(session: any): boolean {
+        const rcptCount = session.rcptCount || 0;
+        const timeframe = Date.now() - (session.startTime || Date.now());
+        
+        // More than 10 recipients in less than 1 minute
+        return rcptCount > 10 && timeframe < 60000;
     }
 
-    private async logRcptTo(to: any, session: any) {
-        const trafficLog = {
-            sourceIp: session.remoteAddress,
-            timestamp: new Date(),
-            protocol: 'SMTP' as const,
-            requestData: {
-                method: 'RCPT TO',
-                headers: {},
-                payload: {
-                    to: to.address,
-                    args: to.args
-                }
+    private extractHeaders(message: string): Record<string, string> {
+        const headers: Record<string, string> = {};
+        const headerSection = message.split('\r\n\r\n')[0];
+        
+        headerSection.split('\r\n').forEach(line => {
+            const [key, ...values] = line.split(':');
+            if (key && values.length) {
+                headers[key.trim().toLowerCase()] = values.join(':').trim();
             }
-        };
+        });
 
-        await TrafficLogModel.create(trafficLog);
+        return headers;
     }
 
-    private async logMessageData(data: string, session: any) {
-        const trafficLog = {
-            sourceIp: session.remoteAddress,
-            timestamp: new Date(),
-            protocol: 'SMTP' as const,
-            requestData: {
-                method: 'DATA',
-                headers: {},
-                payload: {
-                    size: data.length,
-                    // Store only metadata, not actual content for security
-                    metadata: {
-                        hasAttachments: data.includes('Content-Disposition: attachment'),
-                        contentType: data.match(/Content-Type: ([^\r\n]+)/)?.[1] || 'unknown'
-                    }
-                }
-            }
-        };
-
-        await TrafficLogModel.create(trafficLog);
+    private async logTraffic(data: TrafficData) {
+        await TrafficLogModel.create(data);
     }
 
     async start() {

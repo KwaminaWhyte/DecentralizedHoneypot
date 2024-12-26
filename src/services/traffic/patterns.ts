@@ -123,59 +123,39 @@ export class TrafficPatternGenerator {
         pattern: keyof typeof TrafficPatternGenerator.ATTACK_PATTERNS,
         duration: number = 60000 // default 1 minute
     ): TrafficData[] {
-        const config = this.ATTACK_PATTERNS[pattern];
-        const trafficData: TrafficData[] = [];
-        const startTime = Date.now();
-        const uniqueIps = this.generateIPs(config.requestRate, config.ipSpread);
-
-        let currentTime = startTime;
-        while (currentTime < startTime + duration) {
-            // Generate burst
-            const burstSize = Math.floor(
-                Math.random() * (config.burstSize.max - config.burstSize.min) + 
-                config.burstSize.min
-            );
+        console.log(`Generating ${pattern} traffic data for ${duration}ms...`);
+        try {
+            const patternConfig = TrafficPatternGenerator.ATTACK_PATTERNS[pattern];
+            const data: TrafficData[] = [];
             
-            const burstDuration = Math.floor(
-                Math.random() * (config.burstDuration.max - config.burstDuration.min) + 
-                config.burstDuration.min
-            );
-
-            // Generate requests within burst
-            for (let i = 0; i < burstSize; i++) {
-                const timestamp = currentTime + Math.floor(Math.random() * burstDuration);
-                const sourceIp = Array.from(uniqueIps)[Math.floor(Math.random() * uniqueIps.size)];
-
-                const data: TrafficData = {
-                    protocol: config.protocol as 'http' | 'dns' | 'smtp',
-                    requestCount: 1,
-                    timeWindow: duration,
-                    uniqueIps: new Set([sourceIp]),
-                    sourceIp,
-                    timestamp
-                };
-
-                // Add protocol-specific data
-                if (config.protocol === 'http') {
-                    data.paths = this.generatePaths(config);
-                } else if (config.protocol === 'dns') {
-                    data.queryTypes = [
-                        config.queryTypes[Math.floor(Math.random() * config.queryTypes.length)]
-                    ];
+            let time = 0;
+            while (time < duration) {
+                // Generate burst
+                const burstSize = Math.floor(
+                    Math.random() * (patternConfig.burstSize.max - patternConfig.burstSize.min) + 
+                    patternConfig.burstSize.min
+                );
+                
+                // Generate requests for this burst
+                for (let i = 0; i < burstSize; i++) {
+                    const trafficData = this.generateSingleRequest(patternConfig);
+                    data.push(trafficData);
                 }
-
-                trafficData.push(data);
+                
+                // Wait for next burst
+                const burstInterval = Math.floor(
+                    Math.random() * (patternConfig.burstInterval.max - patternConfig.burstInterval.min) + 
+                    patternConfig.burstInterval.min
+                );
+                time += burstInterval;
             }
-
-            // Move to next burst
-            const burstInterval = Math.floor(
-                Math.random() * (config.burstInterval.max - config.burstInterval.min) + 
-                config.burstInterval.min
-            );
-            currentTime += burstInterval;
+            
+            console.log(`Generated ${data.length} requests for ${pattern}`);
+            return data;
+        } catch (error) {
+            console.error(`Error generating ${pattern} traffic:`, error);
+            throw error;
         }
-
-        return trafficData.sort((a, b) => a.timestamp - b.timestamp);
     }
 
     // Generate mixed traffic with more realistic background noise
@@ -183,62 +163,89 @@ export class TrafficPatternGenerator {
         duration: number = 60000,
         attackType?: keyof typeof TrafficPatternGenerator.ATTACK_PATTERNS
     ): TrafficData[] {
-        // Generate low-volume background traffic
-        const normalTraffic = this.generateNormalTraffic(duration);
-        
-        // If attack type specified, add attack traffic
-        if (attackType) {
-            const attackTraffic = this.generateTrafficData(attackType, duration);
-            return [...normalTraffic, ...attackTraffic].sort((a, b) => a.timestamp - b.timestamp);
+        console.log(`Generating mixed traffic data for ${duration}ms...`);
+        try {
+            const data: TrafficData[] = [];
+            
+            // Generate normal background traffic
+            const normalConfig = {
+                protocol: ['http', 'dns', 'smtp'],
+                paths: ['/api', '/data', '/public'],
+                minBurstSize: 1,
+                maxBurstSize: 5,
+                minBurstInterval: 1000,
+                maxBurstInterval: 5000,
+                minUniqueIPs: 1,
+                maxUniqueIPs: 3
+            };
+            
+            let time = 0;
+            while (time < duration) {
+                const burstSize = Math.floor(
+                    Math.random() * (normalConfig.maxBurstSize - normalConfig.minBurstSize) + 
+                    normalConfig.minBurstSize
+                );
+                
+                for (let i = 0; i < burstSize; i++) {
+                    const protocol = normalConfig.protocol[
+                        Math.floor(Math.random() * normalConfig.protocol.length)
+                    ] as 'http' | 'dns' | 'smtp';
+                    
+                    const uniqueIps = new Set(
+                        Array.from(
+                            { length: Math.floor(Math.random() * 3) + 1 },
+                            () => `192.168.1.${Math.floor(Math.random() * 255)}`
+                        )
+                    );
+                    
+                    data.push({
+                        protocol,
+                        requestCount: 1,
+                        timeWindow: 60000,
+                        uniqueIps,
+                        paths: [normalConfig.paths[Math.floor(Math.random() * normalConfig.paths.length)]],
+                        sourceIp: Array.from(uniqueIps)[0],
+                        timestamp: Date.now() + time
+                    });
+                }
+                
+                const interval = Math.floor(
+                    Math.random() * (normalConfig.maxBurstInterval - normalConfig.minBurstInterval) + 
+                    normalConfig.minBurstInterval
+                );
+                time += interval;
+            }
+            
+            console.log(`Generated ${data.length} requests for mixed traffic`);
+            return data;
+        } catch (error) {
+            console.error('Error generating mixed traffic:', error);
+            throw error;
         }
-
-        return normalTraffic;
     }
 
-    // Generate normal background traffic with realistic patterns
-    private static generateNormalTraffic(duration: number): TrafficData[] {
-        const trafficData: TrafficData[] = [];
-        const protocols: Array<'http' | 'dns' | 'smtp'> = ['http', 'dns', 'smtp'];
-        const startTime = Date.now();
+    private static generateSingleRequest(patternConfig: any): TrafficData {
+        const sourceIp = Array.from(this.generateIPs(patternConfig.requestRate, patternConfig.ipSpread))[0];
+        const timestamp = Date.now();
 
-        protocols.forEach(protocol => {
-            // Normal traffic rates
-            const requestRate = {
-                http: { min: 2, max: 10 },  // 2-10 requests per second
-                dns: { min: 1, max: 5 },    // 1-5 requests per second
-                smtp: { min: 0.1, max: 1 }  // 0.1-1 requests per second
-            }[protocol];
+        const data: TrafficData = {
+            protocol: patternConfig.protocol as 'http' | 'dns' | 'smtp',
+            requestCount: 1,
+            timeWindow: 60000,
+            uniqueIps: new Set([sourceIp]),
+            sourceIp,
+            timestamp
+        };
 
-            const totalRequests = Math.floor(
-                (Math.random() * (requestRate.max - requestRate.min) + requestRate.min) * 
-                (duration / 1000)
-            );
+        // Add protocol-specific data
+        if (patternConfig.protocol === 'http') {
+            data.paths = this.generatePaths(patternConfig);
+        } else if (patternConfig.protocol === 'dns') {
+            data.queryTypes = [
+                patternConfig.queryTypes[Math.floor(Math.random() * patternConfig.queryTypes.length)]
+            ];
+        }
 
-            const uniqueIps = this.generateIPs(totalRequests, 'medium');
-
-            for (let i = 0; i < totalRequests; i++) {
-                const timestamp = startTime + Math.floor(Math.random() * duration);
-                const sourceIp = Array.from(uniqueIps)[Math.floor(Math.random() * uniqueIps.size)];
-
-                const data: TrafficData = {
-                    protocol,
-                    requestCount: 1,
-                    timeWindow: duration,
-                    uniqueIps: new Set([sourceIp]),
-                    sourceIp,
-                    timestamp
-                };
-
-                if (protocol === 'http') {
-                    data.paths = ['/'].concat(Math.random() < 0.2 ? this.generatePaths({}) : []);
-                } else if (protocol === 'dns') {
-                    data.queryTypes = ['A', 'AAAA', 'MX'][Math.floor(Math.random() * 3)];
-                }
-
-                trafficData.push(data);
-            }
-        });
-
-        return trafficData.sort((a, b) => a.timestamp - b.timestamp);
+        return data;
     }
 }

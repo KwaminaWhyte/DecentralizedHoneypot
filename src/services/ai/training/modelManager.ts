@@ -1,6 +1,8 @@
 import * as tf from '@tensorflow/tfjs';
 import { TrafficPatternGenerator } from '../../traffic/patterns';
 import type { TrafficData } from '../../../types';
+import * as fs from 'fs';
+import * as path from 'path';
 
 interface ModelVersion {
     version: string;
@@ -40,20 +42,17 @@ export class ModelManager {
 
     private async loadVersionHistory() {
         try {
-            const history = await tf.io.listModels();
-            for (const [key, value] of Object.entries(history)) {
-                if (key.startsWith(`indexeddb://${this.storageKey}`)) {
-                    const version = key.split('-v')[1];
-                    const metadata = value.modelTopologyBytes ? 
-                        JSON.parse(new TextDecoder().decode(value.modelTopologyBytes)) : 
-                        {};
-                    
-                    if (metadata.version) {
-                        this.versions.set(version, metadata);
-                        // Update current version if this is newer
-                        if (this.compareVersions(version, this.currentVersion) > 0) {
-                            this.currentVersion = version;
-                        }
+            const modelsDir = path.join(process.cwd(), 'models');
+            const files = fs.readdirSync(modelsDir);
+            for (const file of files) {
+                if (file.startsWith('model-v') && file.endsWith('-metadata.json')) {
+                    const version = file.split('-v')[1].split('-metadata.json')[0];
+                    const metadataPath = path.join(modelsDir, file);
+                    const versionInfo = JSON.parse(fs.readFileSync(metadataPath, 'utf-8')) as ModelVersion;
+                    this.versions.set(version, versionInfo);
+                    // Update current version if this is newer
+                    if (this.compareVersions(version, this.currentVersion) > 0) {
+                        this.currentVersion = version;
                     }
                 }
             }
@@ -89,37 +88,49 @@ export class ModelManager {
 
     public async trainNewVersion(hyperparameters?: Partial<ModelVersion['hyperparameters']>) {
         const nextVersion = this.generateNextVersion();
-        console.log(`Training model version ${nextVersion}...`);
+        console.log(`\nInitializing training for model version ${nextVersion}...`);
 
         // Default hyperparameters
         const params = {
             learningRate: 0.001,
             batchSize: 32,
-            epochs: 50,
-            layers: [64, 32, 16],
+            epochs: 20,
+            layers: [32, 16, 8],
             ...hyperparameters
         };
 
+        console.log('Generating training data...');
         // Generate training data
         const trainingData = await this.generateTrainingData();
+        console.log(`Generated ${trainingData.features.shape[0]} training samples`);
         
+        console.log('Creating model architecture...');
         // Create and train model
         const model = this.createModel(params);
-        const { metrics, trainedModel } = await this.trainModel(model, trainingData, params);
+        console.log('Model architecture created');
 
-        // Save model with version metadata
-        const versionInfo: ModelVersion = {
-            version: nextVersion,
-            timestamp: Date.now(),
-            metrics,
-            hyperparameters: params
-        };
+        console.log('\nStarting model training...');
+        try {
+            const { metrics, trainedModel } = await this.trainModel(model, trainingData, params);
 
-        await this.saveModel(trainedModel, versionInfo);
-        this.versions.set(nextVersion, versionInfo);
-        this.currentVersion = nextVersion;
+            // Save model with version metadata
+            const versionInfo: ModelVersion = {
+                version: nextVersion,
+                timestamp: Date.now(),
+                metrics,
+                hyperparameters: params
+            };
 
-        return versionInfo;
+            console.log('Saving model...');
+            await this.saveModel(trainedModel, versionInfo);
+            this.versions.set(nextVersion, versionInfo);
+            this.currentVersion = nextVersion;
+
+            return versionInfo;
+        } catch (error) {
+            console.error('Error during model training:', error);
+            throw error;
+        }
     }
 
     private createModel(params: ModelVersion['hyperparameters']): tf.LayersModel {
@@ -157,12 +168,14 @@ export class ModelManager {
     }
 
     private async generateTrainingData() {
+        console.log('Generating attack patterns...');
         const duration = 300000; // 5 minutes per pattern
         const patterns = ['HTTP_FLOOD', 'DNS_AMPLIFICATION', 'SMTP_BRUTE_FORCE', 'SLOW_LORIS'] as const;
         const trainingData: Array<{ input: TrafficData, label: string }> = [];
 
         // Generate attack patterns
         for (const pattern of patterns) {
+            console.log(`Generating ${pattern} pattern...`);
             const data = TrafficPatternGenerator.generateTrafficData(pattern, duration);
             data.forEach(input => {
                 trainingData.push({
@@ -173,6 +186,7 @@ export class ModelManager {
         }
 
         // Generate normal traffic
+        console.log('Generating normal traffic pattern...');
         const normalTraffic = TrafficPatternGenerator.generateMixedTraffic(duration);
         normalTraffic.forEach(input => {
             trainingData.push({
@@ -181,6 +195,7 @@ export class ModelManager {
             });
         });
 
+        console.log('Preprocessing training data...');
         return this.preprocessTrainingData(trainingData);
     }
 
@@ -245,22 +260,72 @@ export class ModelManager {
         const valFeatures = features.slice([splitIdx, 0], [-1, -1]);
         const valLabels = labels.slice([splitIdx, 0], [-1, -1]);
 
+        // Progress tracking
+        let startTime = Date.now();
+        let lastLogTime = startTime;
+
         // Train model
         const history = await model.fit(trainFeatures, trainLabels, {
             epochs: params.epochs,
             batchSize: params.batchSize,
             validationData: [valFeatures, valLabels],
             callbacks: {
+                onEpochBegin: (epoch) => {
+                    if (epoch === 0) {
+                        console.log('\nStarting training...');
+                        console.log('Epochs:', params.epochs);
+                        console.log('Batch size:', params.batchSize);
+                        console.log('Learning rate:', params.learningRate);
+                        console.log('Training samples:', trainFeatures.shape[0]);
+                        console.log('Validation samples:', valFeatures.shape[0]);
+                        console.log('\nTraining progress:');
+                    }
+                },
                 onEpochEnd: (epoch, logs) => {
-                    console.log(`Epoch ${epoch + 1}: loss = ${logs?.loss.toFixed(4)}, accuracy = ${logs?.acc.toFixed(4)}`);
+                    const currentTime = Date.now();
+                    const elapsedMinutes = ((currentTime - startTime) / 1000 / 60).toFixed(1);
+                    const epochsRemaining = params.epochs - (epoch + 1);
+                    const timePerEpoch = (currentTime - startTime) / (epoch + 1);
+                    const estimatedTimeRemaining = ((epochsRemaining * timePerEpoch) / 1000 / 60).toFixed(1);
+
+                    // Log every 5 epochs or if more than 30 seconds passed
+                    if (epoch % 5 === 0 || currentTime - lastLogTime > 30000) {
+                        console.log(
+                            `Epoch ${epoch + 1}/${params.epochs} - ` +
+                            `loss: ${logs?.loss.toFixed(4)} - ` +
+                            `accuracy: ${logs?.acc.toFixed(4)} - ` +
+                            `val_loss: ${logs?.val_loss.toFixed(4)} - ` +
+                            `val_accuracy: ${logs?.val_acc.toFixed(4)}`
+                        );
+                        console.log(
+                            `Time elapsed: ${elapsedMinutes}m - ` +
+                            `Estimated time remaining: ${estimatedTimeRemaining}m`
+                        );
+                        lastLogTime = currentTime;
+                    }
+
+                    // Early stopping if validation loss is not improving
+                    if (epoch > 10 && logs?.val_loss > 1.0) {
+                        console.log('\nStopping early due to high validation loss');
+                        model.stopTraining = true;
+                    }
                 }
             }
         });
 
         // Calculate metrics
+        console.log('\nCalculating final metrics...');
         const evaluation = await model.evaluate(valFeatures, valLabels) as tf.Scalar[];
         const predictions = model.predict(valFeatures) as tf.Tensor;
         const metrics = this.calculateMetrics(valLabels, predictions);
+
+        console.log('\nTraining completed!');
+        console.log('Final metrics:');
+        console.log('- Accuracy:', metrics.accuracy.toFixed(4));
+        console.log('- Precision:', metrics.precision.toFixed(4));
+        console.log('- Recall:', metrics.recall.toFixed(4));
+        console.log('- F1 Score:', metrics.f1Score.toFixed(4));
+        console.log(`Total training time: ${((Date.now() - startTime) / 1000 / 60).toFixed(1)} minutes`);
 
         // Cleanup
         features.dispose();
@@ -312,21 +377,50 @@ export class ModelManager {
     }
 
     private async saveModel(model: tf.LayersModel, versionInfo: ModelVersion) {
-        const modelPath = `indexeddb://${this.storageKey}-v${versionInfo.version}`;
-        await model.save(modelPath);
-        console.log(`Model version ${versionInfo.version} saved successfully`);
+        try {
+            // Create models directory if it doesn't exist
+            const modelsDir = path.join(process.cwd(), 'models');
+            if (!fs.existsSync(modelsDir)) {
+                fs.mkdirSync(modelsDir, { recursive: true });
+            }
+
+            // Save model files
+            const modelPath = path.join(modelsDir, `model-v${versionInfo.version}`);
+            await model.save(`file://${modelPath}`);
+
+            // Save version metadata
+            const metadataPath = path.join(modelsDir, `model-v${versionInfo.version}-metadata.json`);
+            fs.writeFileSync(metadataPath, JSON.stringify(versionInfo, null, 2));
+
+            console.log(`Model version ${versionInfo.version} saved successfully to ${modelPath}`);
+            console.log(`Model metadata saved to ${metadataPath}`);
+        } catch (error) {
+            console.error('Error saving model:', error);
+            throw error;
+        }
     }
 
-    public async loadModel(version?: string): Promise<tf.LayersModel> {
-        const targetVersion = version || this.currentVersion;
-        const modelPath = `indexeddb://${this.storageKey}-v${targetVersion}`;
-        
+    private async loadModel(version?: string): Promise<{ model: tf.LayersModel, versionInfo: ModelVersion }> {
         try {
-            const model = await tf.loadLayersModel(modelPath);
-            console.log(`Loaded model version ${targetVersion}`);
-            return model;
+            const targetVersion = version || this.currentVersion;
+            if (!targetVersion) {
+                throw new Error('No model version specified and no current version set');
+            }
+
+            const modelsDir = path.join(process.cwd(), 'models');
+            const modelPath = path.join(modelsDir, `model-v${targetVersion}`);
+            const metadataPath = path.join(modelsDir, `model-v${targetVersion}-metadata.json`);
+
+            // Load model
+            const model = await tf.loadLayersModel(`file://${modelPath}/model.json`);
+            
+            // Load metadata
+            const versionInfo = JSON.parse(fs.readFileSync(metadataPath, 'utf-8')) as ModelVersion;
+
+            console.log(`Model version ${targetVersion} loaded successfully from ${modelPath}`);
+            return { model, versionInfo };
         } catch (error) {
-            console.error(`Error loading model version ${targetVersion}:`, error);
+            console.error('Error loading model:', error);
             throw error;
         }
     }

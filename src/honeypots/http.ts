@@ -79,62 +79,115 @@ export class HttpHoneypot {
     }
 
     private async handleRequest(context: any) {
-        try {
-            const sourceIp = context.request.headers.get('x-forwarded-for') || 
-                           context.request.headers.get('x-real-ip') || 
-                           context.request.headers.get('cf-connecting-ip') ||
-                           context.request.socket?.remoteAddress || '0.0.0.0';
+        const ip = context.request.headers['x-forwarded-for'] || context.request.ip;
+        
+        if (this.blockedIPs.has(ip)) {
+            return new Response('Access Denied', { status: 403 });
+        }
 
-            const recentTraffic = await TrafficLogModel.find({
-                sourceIp,
-                protocol: 'HTTP',
-                timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
-            }).sort({ timestamp: -1 }).limit(100);
+        // Enhanced rate limiting with burst allowance
+        const rateLimit = await this.rateLimiter.checkLimit(ip, {
+            windowMs: 60000,
+            maxRequests: 100,
+            burstAllowance: 20,
+            burstDuration: 5000
+        });
 
-            // Analyze for potential attacks if we have enough traffic
-            if (recentTraffic.length > 10) {
-                try {
-                    const classification = await this.predictor.predictAttack(recentTraffic);
-                    
-                    if (classification.confidence > 0.7) {
-                        // Raise an alert
-                        await this.alertService.raiseAlert({
-                            sourceIp,
-                            protocol: 'HTTP',
-                            attackType: classification.attackType,
-                            confidence: classification.confidence,
-                            details: classification.details.indicators || [],
-                            metrics: {
-                                requestCount: recentTraffic.length,
-                                burstCount: classification.details.burstCount || 0,
-                                averageInterval: classification.details.avgInterval || 0
-                            }
-                        });
-                    }
-                } catch (error) {
-                    console.error('Error analyzing traffic:', error);
+        if (!rateLimit.allowed) {
+            this.blockedIPs.add(ip);
+            setTimeout(() => this.blockedIPs.delete(ip), 300000); // 5-minute block
+            return new Response('Rate limit exceeded', { status: 429 });
+        }
+
+        // Enhanced traffic logging with path analysis
+        const path = new URL(context.request.url).pathname;
+        const data: TrafficData = {
+            protocol: 'http',
+            requestCount: 1,
+            timeWindow: 60000,
+            uniqueIps: new Set([ip]),
+            paths: [path],
+            sourceIp: ip,
+            timestamp: Date.now(),
+            headers: Object.fromEntries(context.request.headers.entries()),
+            method: context.request.method,
+            queryParams: Object.fromEntries(new URL(context.request.url).searchParams),
+            payloadSize: parseInt(context.request.headers['content-length'] || '0')
+        };
+
+        this.logTraffic(data);
+
+        // Real-time attack prediction
+        const prediction = await this.predictor.predict(data);
+        
+        if (prediction.confidence > 0.85) {
+            this.alertService.emit('attack', {
+                type: prediction.attackType,
+                confidence: prediction.confidence,
+                sourceIp: ip,
+                timestamp: new Date(),
+                details: {
+                    path,
+                    method: context.request.method,
+                    headers: data.headers,
+                    queryParams: data.queryParams
                 }
+            });
+
+            if (prediction.attackType === 'ddos') {
+                this.blockedIPs.add(ip);
+                return new Response('Access Denied', { status: 403 });
             }
+        }
 
-            // Return random responses to keep attacker engaged
-            const responses = [
-                { status: 200, body: { message: 'Success', data: { id: Math.random() } } },
-                { status: 503, body: { error: 'Service Temporarily Unavailable' } },
-                { status: 429, body: { error: 'Too Many Requests' } },
-                { status: 403, body: { error: 'Forbidden' } }
-            ];
+        // Generate realistic response
+        return this.generateResponse(path);
+    }
 
-            const response = responses[Math.floor(Math.random() * responses.length)];
-            return new Response(JSON.stringify(response.body), {
-                status: response.status,
+    private generateResponse(path: string): Response {
+        // Enhanced response generation based on path
+        const responses = {
+            '/': {
+                status: 200,
+                body: '<html><body><h1>Welcome</h1></body></html>',
+                headers: { 'Content-Type': 'text/html' }
+            },
+            '/api': {
+                status: 200,
+                body: JSON.stringify({ status: 'ok' }),
                 headers: { 'Content-Type': 'application/json' }
-            });
+            },
+            '/admin': {
+                status: 401,
+                body: 'Unauthorized',
+                headers: { 'WWW-Authenticate': 'Basic' }
+            }
+        };
+
+        const defaultResponse = {
+            status: 404,
+            body: 'Not Found',
+            headers: { 'Content-Type': 'text/plain' }
+        };
+
+        const response = responses[path] || defaultResponse;
+        return new Response(response.body, {
+            status: response.status,
+            headers: {
+                ...response.headers,
+                'Server': 'Apache/2.4.41 (Unix)',
+                'X-Powered-By': 'PHP/7.4.3',
+                'Date': new Date().toUTCString()
+            }
+        });
+    }
+
+    private async logTraffic(data: TrafficData) {
+        try {
+            await TrafficLogModel.create(data);
+            console.log(`HTTP Request logged from ${data.sourceIp}: ${data.method} ${data.paths[0]}`);
         } catch (error) {
-            console.error('Error handling request:', error);
-            return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
-                status: 500,
-                headers: { 'Content-Type': 'application/json' }
-            });
+            console.error('Error logging HTTP request:', error);
         }
     }
 
@@ -142,4 +195,18 @@ export class HttpHoneypot {
         await this.app.listen(config.honeypots.http.port);
         console.log(`HTTP Honeypot listening on port ${config.honeypots.http.port}`);
     }
+}
+
+interface TrafficData {
+    protocol: string;
+    requestCount: number;
+    timeWindow: number;
+    uniqueIps: Set<string>;
+    paths: string[];
+    sourceIp: string;
+    timestamp: number;
+    headers: { [key: string]: string };
+    method: string;
+    queryParams: { [key: string]: string };
+    payloadSize: number;
 }

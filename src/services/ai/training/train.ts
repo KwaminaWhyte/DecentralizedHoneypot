@@ -7,7 +7,12 @@ async function main() {
 
         // Train initial model with default hyperparameters
         console.log('Training initial model...');
-        const initialVersion = await modelManager.trainNewVersion();
+        const initialVersion = await modelManager.trainNewVersion({
+            learningRate: 0.001,
+            batchSize: 32,
+            epochs: 20,
+            layers: [32, 16, 8]
+        });
         console.log('Initial model metrics:', initialVersion.metrics);
 
         // Train model with different hyperparameters
@@ -15,8 +20,8 @@ async function main() {
         const customVersion = await modelManager.trainNewVersion({
             learningRate: 0.0005,
             batchSize: 64,
-            epochs: 100,
-            layers: [128, 64, 32]
+            epochs: 30,
+            layers: [64, 32, 16]
         });
         console.log('Custom model metrics:', customVersion.metrics);
 
