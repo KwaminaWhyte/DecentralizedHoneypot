@@ -20,10 +20,10 @@ export default {
         },
         dns: {
             enabled: true,
-            port: process.env.DNS_HONEYPOT_PORT ? parseInt(process.env.DNS_HONEYPOT_PORT) : 53
+            port: process.env.DNS_HONEYPOT_PORT ? parseInt(process.env.DNS_HONEYPOT_PORT) : 5353
         },
         smtp: {
-            port: process.env.SMTP_HONEYPOT_PORT ? parseInt(process.env.SMTP_HONEYPOT_PORT) : 25
+            port: process.env.SMTP_HONEYPOT_PORT ? parseInt(process.env.SMTP_HONEYPOT_PORT) : 2525
         }
     }
 };

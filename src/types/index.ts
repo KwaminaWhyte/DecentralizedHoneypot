@@ -2,7 +2,7 @@
 export interface TrafficLog {
     sourceIp: string;
     timestamp: Date;
-    protocol: 'HTTP' | 'DNS';
+    protocol: 'http' | 'dns' | 'smtp';
     requestData: {
         method?: string;
         path?: string;
@@ -16,11 +16,22 @@ export interface TrafficLog {
     };
 }
 
+export interface TrafficData {
+    protocol: 'http' | 'dns' | 'smtp';
+    requestCount: number;
+    timeWindow: number;
+    uniqueIps: string[] | Set<string>;
+    paths?: string[];
+    queryTypes?: string[];
+    sourceIp: string;
+    timestamp: number;
+}
+
 export interface AttackClassification {
     attackType: string;
     confidence: number;
     timestamp: Date;
-    details: Record<string, any>;
+    details: Record<string, string | number | boolean>;
 }
 
 export interface BlockchainLog {
@@ -28,18 +39,14 @@ export interface BlockchainLog {
     attackId: string;
     timestamp: Date;
     classification: AttackClassification;
-    trafficSummary: {
-        sourceIp: string;
-        requestCount: number;
-        protocol: string;
-    };
+    trafficSummary: any;
 }
 
 export interface AttackAlert {
     id: string;
     timestamp: Date;
     sourceIp: string;
-    protocol: 'HTTP' | 'DNS';
+    protocol: 'http' | 'dns' | 'smtp';
     attackType: string;
     confidence: number;
     details: string[];
@@ -61,4 +68,16 @@ export interface BurstPeriod {
     end: Date;
     count: number;
     duration: number;
+}
+
+export interface HoneypotConfig {
+    http: {
+        port: number;
+    };
+    dns: {
+        port: number;
+    };
+    smtp: {
+        port: number;
+    };
 }

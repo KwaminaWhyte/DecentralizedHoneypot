@@ -151,37 +151,53 @@ class TrafficSimulator {
     }
 
     async start(duration: number = 60, patternType: 'normal' | 'suspicious' | 'attack' = 'normal') {
-        const pattern = patterns[patternType];
-        const startTime = Date.now();
-        
-        console.log(`Starting ${patternType} traffic simulation for ${duration} seconds...`);
+        try {
+            const pattern = patterns[patternType];
+            const startTime = Date.now();
+            
+            console.log(`Starting ${patternType} traffic simulation for ${duration} seconds...`);
 
-        while (Date.now() - startTime < duration * 1000) {
-            if (Math.random() < pattern.burstProbability) {
-                // Simulate a burst of 5-15 requests
-                const burstSize = Math.floor(Math.random() * 10) + 5;
-                await this.simulateTrafficBurst(pattern, burstSize);
-            } else {
-                // Single request
-                const protocol = Math.random();
-                if (protocol < 0.4) {
-                    await this.simulateHttpTraffic(pattern);
-                } else if (protocol < 0.7) {
-                    await this.simulateDnsTraffic(pattern);
-                } else {
-                    await this.simulateSmtpTraffic(pattern);
+            while (Date.now() - startTime < duration * 1000) {
+                try {
+                    if (Math.random() < pattern.burstProbability) {
+                        // Simulate a burst of 5-15 requests
+                        const burstSize = Math.floor(Math.random() * 10) + 5;
+                        await this.simulateTrafficBurst(pattern, burstSize);
+                    } else {
+                        // Single request
+                        const protocol = Math.random();
+                        if (protocol < 0.4) {
+                            await this.simulateHttpTraffic(pattern);
+                        } else if (protocol < 0.7) {
+                            await this.simulateDnsTraffic(pattern);
+                        } else {
+                            await this.simulateSmtpTraffic(pattern);
+                        }
+                    }
+
+                    // Random delay between requests
+                    const delay = Math.random() * (pattern.maxDelay - pattern.minDelay) + pattern.minDelay;
+                    await sleep(delay);
+                } catch (error) {
+                    console.error('Error during traffic simulation:', error);
+                    // Continue simulation despite errors
+                    await sleep(1000); // Wait a bit before retrying
                 }
             }
-
-            // Random delay between requests
-            const delay = Math.random() * (pattern.maxDelay - pattern.minDelay) + pattern.minDelay;
-            await sleep(delay);
+        } catch (error) {
+            console.error('Fatal error in traffic simulation:', error);
+            throw error; // Re-throw to trigger cleanup
         }
     }
 
     cleanup() {
-        this.dnsClient.close();
-        this.smtpClient.close();
+        // Close DNS client
+        if (this.dnsClient) {
+            this.dnsClient.close();
+        }
+
+        // SMTP client doesn't need explicit cleanup
+        this.smtpClient = null;
     }
 }
 
