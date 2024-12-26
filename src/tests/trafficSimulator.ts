@@ -3,6 +3,7 @@ import dns from 'dns/promises';
 import { SMTPClient } from 'emailjs';
 import { createSocket } from 'dgram';
 import config from '../config';
+import { TrafficPatternGenerator } from '../services/traffic/patterns';
 
 // Simulate different traffic patterns
 const patterns = {
@@ -11,33 +12,17 @@ const patterns = {
     attack: { minDelay: 10, maxDelay: 100, burstProbability: 0.8 }
 };
 
-// Test endpoints for HTTP
-const endpoints = ['/api', '/data', '/admin', '/test', '/login'];
-
-// Test domains for DNS
-const domains = ['test.com', 'example.com', 'honeypot.local', 'attack.test'];
-
-// Test email addresses for SMTP
-const emailAddresses = [
-    'test@example.com',
-    'admin@test.com',
-    'user@honeypot.local',
-    'spam@attack.test'
-];
-
 async function sleep(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 class TrafficSimulator {
     private httpEndpoint: string;
-    private dnsEndpoint: string;
     private dnsClient: ReturnType<typeof createSocket>;
     private smtpClient: SMTPClient;
 
     constructor() {
         this.httpEndpoint = `http://localhost:${config.honeypots.http.port}`;
-        this.dnsEndpoint = 'localhost';
         this.dnsClient = createSocket('udp4');
         
         this.smtpClient = new SMTPClient({
@@ -48,165 +33,187 @@ class TrafficSimulator {
             tls: false,
             timeout: 5000
         });
-
-        // Handle DNS client errors
-        this.dnsClient.on('error', (err) => {
-            console.error('DNS client error:', err);
-        });
     }
 
-    async simulateHttpTraffic(pattern: any) {
-        try {
-            const endpoint = endpoints[Math.floor(Math.random() * endpoints.length)];
-            const response = await axios.get(`${this.httpEndpoint}${endpoint}`, {
-                validateStatus: () => true // Accept any status code
-            });
-            console.log(`HTTP Request to ${endpoint}: ${response.status}`);
-        } catch (error) {
-            console.error('HTTP Request failed:', error.message);
-        }
-    }
-
-    async simulateDnsTraffic(pattern: any) {
-        try {
-            const domain = domains[Math.floor(Math.random() * domains.length)];
-            const query = this.createDnsQuery(domain);
-            
-            return new Promise<void>((resolve) => {
-                this.dnsClient.send(query, 53, this.dnsEndpoint, (err) => {
-                    if (err) {
-                        console.error('DNS Query failed:', err.message);
-                    } else {
-                        console.log(`DNS Query for ${domain}`);
+    private async simulateHTTPTraffic(trafficData: any) {
+        const { paths = ['/'], sourceIp } = trafficData;
+        
+        for (const path of paths) {
+            try {
+                await axios.get(`${this.httpEndpoint}${path}`, {
+                    headers: {
+                        'X-Forwarded-For': sourceIp,
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                     }
-                    resolve();
                 });
-            });
-        } catch (error) {
-            console.error('DNS Query failed:', error.message);
+            } catch (error) {
+                // Ignore errors as honeypot may return various status codes
+            }
         }
     }
 
-    async simulateSmtpTraffic(pattern: any) {
-        try {
-            const from = emailAddresses[Math.floor(Math.random() * emailAddresses.length)];
-            const to = emailAddresses[Math.floor(Math.random() * emailAddresses.length)];
+    private async simulateDNSTraffic(trafficData: any) {
+        const { queryTypes = ['A'], sourceIp } = trafficData;
+        const domains = [
+            'test.com',
+            'example.com',
+            'honeypot.local',
+            'attack.test'
+        ];
+
+        for (const queryType of queryTypes) {
+            const domain = domains[Math.floor(Math.random() * domains.length)];
+            const dnsQuery = this.createDNSQuery(domain, queryType);
             
-            await this.smtpClient.sendAsync({
-                from,
-                to,
+            this.dnsClient.send(dnsQuery, config.honeypots.dns.port, 'localhost');
+        }
+    }
+
+    private async simulateSMTPTraffic(trafficData: any) {
+        const { sourceIp } = trafficData;
+        const emailAddresses = [
+            'test@example.com',
+            'admin@test.com',
+            'user@honeypot.local',
+            'spam@attack.test'
+        ];
+
+        try {
+            await this.smtpClient.send({
+                from: emailAddresses[Math.floor(Math.random() * emailAddresses.length)],
+                to: emailAddresses[Math.floor(Math.random() * emailAddresses.length)],
                 subject: 'Test Email',
-                text: 'This is a test email from the honeypot traffic simulator.'
-            });
-            
-            console.log(`SMTP: Sent email from ${from} to ${to}`);
-        } catch (error) {
-            // Expected to sometimes fail as the honeypot randomly rejects
-            console.log('SMTP: Email send attempt (expected random response)');
-        }
-    }
-
-    private createDnsQuery(domain: string): Buffer {
-        // Simple DNS query format
-        const header = Buffer.from([
-            0x00, 0x01, // ID
-            0x01, 0x00, // Flags
-            0x00, 0x01, // QDCOUNT
-            0x00, 0x00, // ANCOUNT
-            0x00, 0x00, // NSCOUNT
-            0x00, 0x00  // ARCOUNT
-        ]);
-
-        // Convert domain to DNS format
-        const parts = domain.split('.');
-        let domainBuffer = Buffer.alloc(domain.length + 2);
-        let offset = 0;
-        for (const part of parts) {
-            domainBuffer[offset] = part.length;
-            domainBuffer.write(part, offset + 1);
-            offset += part.length + 1;
-        }
-        domainBuffer[offset] = 0;
-
-        // Query type (A) and class (IN)
-        const footer = Buffer.from([0x00, 0x01, 0x00, 0x01]);
-
-        return Buffer.concat([header, domainBuffer, footer]);
-    }
-
-    async simulateTrafficBurst(pattern: any, count: number) {
-        const promises = [];
-        for (let i = 0; i < count; i++) {
-            // Randomly choose between protocols
-            const protocol = Math.random();
-            if (protocol < 0.4) {
-                promises.push(this.simulateHttpTraffic(pattern));
-            } else if (protocol < 0.7) {
-                promises.push(this.simulateDnsTraffic(pattern));
-            } else {
-                promises.push(this.simulateSmtpTraffic(pattern));
-            }
-        }
-        await Promise.all(promises);
-    }
-
-    async start(duration: number = 60, patternType: 'normal' | 'suspicious' | 'attack' = 'normal') {
-        try {
-            const pattern = patterns[patternType];
-            const startTime = Date.now();
-            
-            console.log(`Starting ${patternType} traffic simulation for ${duration} seconds...`);
-
-            while (Date.now() - startTime < duration * 1000) {
-                try {
-                    if (Math.random() < pattern.burstProbability) {
-                        // Simulate a burst of 5-15 requests
-                        const burstSize = Math.floor(Math.random() * 10) + 5;
-                        await this.simulateTrafficBurst(pattern, burstSize);
-                    } else {
-                        // Single request
-                        const protocol = Math.random();
-                        if (protocol < 0.4) {
-                            await this.simulateHttpTraffic(pattern);
-                        } else if (protocol < 0.7) {
-                            await this.simulateDnsTraffic(pattern);
-                        } else {
-                            await this.simulateSmtpTraffic(pattern);
-                        }
-                    }
-
-                    // Random delay between requests
-                    const delay = Math.random() * (pattern.maxDelay - pattern.minDelay) + pattern.minDelay;
-                    await sleep(delay);
-                } catch (error) {
-                    console.error('Error during traffic simulation:', error);
-                    // Continue simulation despite errors
-                    await sleep(1000); // Wait a bit before retrying
+                text: 'This is a test email from the traffic simulator.',
+                headers: {
+                    'X-Originating-IP': sourceIp
                 }
-            }
+            });
         } catch (error) {
-            console.error('Fatal error in traffic simulation:', error);
-            throw error; // Re-throw to trigger cleanup
+            // Ignore errors as honeypot may reject connections
         }
     }
 
-    cleanup() {
-        // Close DNS client
-        if (this.dnsClient) {
-            this.dnsClient.close();
-        }
+    private createDNSQuery(domain: string, type: string): Buffer {
+        // Simple DNS query format
+        const buffer = Buffer.alloc(512);
+        let offset = 0;
 
-        // SMTP client doesn't need explicit cleanup
-        this.smtpClient = null;
+        // Transaction ID
+        buffer.writeUInt16BE(Math.floor(Math.random() * 65535), offset);
+        offset += 2;
+
+        // Flags (standard query)
+        buffer.writeUInt16BE(0x0100, offset);
+        offset += 2;
+
+        // Questions count
+        buffer.writeUInt16BE(1, offset);
+        offset += 2;
+
+        // Answer RRs, Authority RRs, Additional RRs
+        buffer.writeUInt16BE(0, offset);
+        offset += 2;
+        buffer.writeUInt16BE(0, offset);
+        offset += 2;
+        buffer.writeUInt16BE(0, offset);
+        offset += 2;
+
+        // Query name
+        const labels = domain.split('.');
+        for (const label of labels) {
+            buffer.writeUInt8(label.length, offset++);
+            buffer.write(label, offset);
+            offset += label.length;
+        }
+        buffer.writeUInt8(0, offset++);
+
+        // Query type
+        const types: { [key: string]: number } = {
+            A: 1,
+            NS: 2,
+            CNAME: 5,
+            SOA: 6,
+            PTR: 12,
+            MX: 15,
+            TXT: 16,
+            AAAA: 28,
+            ANY: 255
+        };
+        buffer.writeUInt16BE(types[type] || 1, offset);
+        offset += 2;
+
+        // Query class (IN)
+        buffer.writeUInt16BE(1, offset);
+        offset += 2;
+
+        return buffer.slice(0, offset);
+    }
+
+    public async simulatePattern(pattern: keyof typeof TrafficPatternGenerator.ATTACK_PATTERNS, duration: number = 60000) {
+        console.log(`Starting ${pattern} traffic simulation for ${duration/1000} seconds...`);
+        
+        const trafficData = TrafficPatternGenerator.generateTrafficData(pattern, duration);
+        
+        for (const data of trafficData) {
+            switch (data.protocol) {
+                case 'http':
+                    await this.simulateHTTPTraffic(data);
+                    break;
+                case 'dns':
+                    await this.simulateDNSTraffic(data);
+                    break;
+                case 'smtp':
+                    await this.simulateSMTPTraffic(data);
+                    break;
+            }
+
+            // Add small delay between requests
+            await sleep(Math.random() * 100);
+        }
+    }
+
+    public async simulateMixedTraffic(duration: number = 60000, attackType?: keyof typeof TrafficPatternGenerator.ATTACK_PATTERNS) {
+        console.log(`Starting mixed traffic simulation for ${duration/1000} seconds...`);
+        
+        const trafficData = TrafficPatternGenerator.generateMixedTraffic(duration, attackType);
+        
+        for (const data of trafficData) {
+            switch (data.protocol) {
+                case 'http':
+                    await this.simulateHTTPTraffic(data);
+                    break;
+                case 'dns':
+                    await this.simulateDNSTraffic(data);
+                    break;
+                case 'smtp':
+                    await this.simulateSMTPTraffic(data);
+                    break;
+            }
+
+            // Add small delay between requests
+            await sleep(Math.random() * 100);
+        }
+    }
+
+    public cleanup() {
+        this.dnsClient.close();
+        this.smtpClient.close();
     }
 }
 
 // Start simulation
 const args = process.argv.slice(2);
-const duration = parseInt(args[0]) || 60;
-const patternType = (args[1] as 'normal' | 'suspicious' | 'attack') || 'normal';
+const duration = parseInt(args[0]) || 60000; // Duration in milliseconds
+const patternType = args[1] as keyof typeof TrafficPatternGenerator.ATTACK_PATTERNS | undefined;
 
 const simulator = new TrafficSimulator();
-simulator.start(duration, patternType)
-    .catch(console.error)
-    .finally(() => simulator.cleanup());
+
+if (patternType) {
+    simulator.simulatePattern(patternType, duration)
+        .then(() => simulator.cleanup())
+        .catch(console.error);
+} else {
+    simulator.simulateMixedTraffic(duration)
+        .then(() => simulator.cleanup())
+        .catch(console.error);
+}

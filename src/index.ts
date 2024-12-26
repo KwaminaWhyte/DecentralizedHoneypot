@@ -1,7 +1,7 @@
 import { Elysia } from "elysia";
 import { connectDB } from './services/db';
 import { HttpHoneypot } from './honeypots/http';
-import { DnsHoneypot } from './honeypots/dns';
+import { DNSHoneypot } from './honeypots/dns';
 import { SmtpHoneypot } from './honeypots/smtp';
 import { TrafficAnalyzer } from './services/traffic/analyzer';
 import { RateLimiter } from './services/traffic/rateLimiter';
@@ -19,7 +19,7 @@ async function main() {
 
     // Start honeypots
     const httpHoneypot = new HttpHoneypot();
-    const dnsHoneypot = new DnsHoneypot();
+    const dnsHoneypot = new DNSHoneypot();
     const smtpHoneypot = new SmtpHoneypot();
 
     await Promise.all([

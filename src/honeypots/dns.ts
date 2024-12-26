@@ -1,86 +1,122 @@
-import { createSocket, Socket, RemoteInfo } from 'dgram';
-import { TrafficLogModel } from '../models/TrafficLog';
-import { AttackPredictor } from '../services/ai/predictor';
+import { createSocket, Socket } from 'dgram';
+import { BaseHoneypot } from './base';
 import config from '../config';
+import type { TrafficData } from '../types';
 
-export class DnsHoneypot {
+export class DNSHoneypot extends BaseHoneypot {
     private server: Socket;
-    private predictor: AttackPredictor;
+    private queryTypes: Map<string, number>;
 
     constructor() {
+        super('dns');
         this.server = createSocket('udp4');
-        this.predictor = AttackPredictor.getInstance();
-        this.setupEventHandlers();
+        this.queryTypes = new Map();
+        this.setupServer();
     }
 
-    private setupEventHandlers() {
+    private setupServer() {
         this.server.on('error', (err) => {
-            console.error('DNS Honeypot error:', err);
+            console.error(`DNS Honeypot error:\n${err.stack}`);
             this.server.close();
         });
 
-        this.server.on('message', this.handleDnsQuery.bind(this));
+        this.server.on('message', (msg, rinfo) => {
+            try {
+                const queryType = this.parseQueryType(msg);
+                this.updateQueryTypes(queryType);
+                
+                // Log traffic
+                const trafficData: TrafficData = {
+                    protocol: 'dns',
+                    requestCount: 1,
+                    timeWindow: 60000, // 1 minute window
+                    uniqueIps: new Set([rinfo.address]),
+                    queryTypes: Array.from(this.queryTypes.keys()),
+                    sourceIp: rinfo.address,
+                    timestamp: Date.now()
+                };
+
+                this.logTraffic(trafficData);
+
+                // Send a simulated response
+                const response = this.createDNSResponse(msg);
+                this.server.send(response, rinfo.port, rinfo.address);
+            } catch (error) {
+                console.error('Error handling DNS query:', error);
+            }
+        });
 
         this.server.on('listening', () => {
             const address = this.server.address();
-            console.log(`DNS Honeypot listening on port ${address.port}`);
+            console.log(`DNS Honeypot started on port ${address.port}`);
         });
     }
 
-    private async handleDnsQuery(msg: Buffer, rinfo: RemoteInfo) {
-        const trafficLog = {
-            sourceIp: rinfo.address,
-            timestamp: new Date(),
-            protocol: 'DNS' as const,
-            requestData: {
-                payload: msg.toString('hex'),
-                size: rinfo.size,
-            }
+    private parseQueryType(msg: Buffer): string {
+        // Basic DNS query type parsing
+        // Skip header (12 bytes) and name
+        let offset = 12;
+        while (msg[offset] !== 0) offset++;
+        offset++; // Skip the terminating zero
+        
+        // Get query type (2 bytes after name)
+        const queryType = msg.readUInt16BE(offset);
+        return this.getQueryTypeName(queryType);
+    }
+
+    private getQueryTypeName(type: number): string {
+        const types: { [key: number]: string } = {
+            1: 'A',
+            2: 'NS',
+            5: 'CNAME',
+            6: 'SOA',
+            12: 'PTR',
+            15: 'MX',
+            16: 'TXT',
+            28: 'AAAA',
+            255: 'ANY'
         };
-
-        // Log the traffic
-        await TrafficLogModel.create(trafficLog);
-
-        // Get recent traffic from this IP for analysis
-        const recentTraffic = await TrafficLogModel.find({
-            sourceIp: rinfo.address,
-            protocol: 'DNS',
-            timestamp: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
-        }).sort({ timestamp: -1 }).limit(100);
-
-        // Analyze for potential attacks
-        if (recentTraffic.length > 10) {
-            try {
-                const classification = await this.predictor.predictAttack(recentTraffic);
-                console.log('Attack classification:', classification);
-                // TODO: Implement attack response strategy based on classification
-            } catch (error) {
-                console.error('Error analyzing DNS traffic:', error);
-            }
-        }
-
-        // Send a random response to keep the attacker engaged
-        const response = Buffer.from(this.generateRandomDnsResponse());
-        this.server.send(response, rinfo.port, rinfo.address);
+        return types[type] || 'UNKNOWN';
     }
 
-    private generateRandomDnsResponse(): string {
-        // Generate a random IP address
-        const ip = Array(4).fill(0).map(() => Math.floor(Math.random() * 256)).join('.');
-        // Simple DNS response format (hex)
-        return `81800001000100000000047465737404636f6d0000010001c00c000100010000003c0004${ip.split('.').map(n => parseInt(n).toString(16).padStart(2, '0')).join('')}`;
+    private updateQueryTypes(queryType: string) {
+        const count = this.queryTypes.get(queryType) || 0;
+        this.queryTypes.set(queryType, count + 1);
     }
 
-    async start() {
-        return new Promise<void>((resolve, reject) => {
-            this.server.bind(config.honeypots.dns.port, () => {
-                console.log(`DNS Honeypot started on port ${config.honeypots.dns.port}`);
-                resolve();
-            });
-        });
+    private createDNSResponse(query: Buffer): Buffer {
+        // Basic DNS response
+        const response = Buffer.alloc(query.length + 16);
+        
+        // Copy query to response
+        query.copy(response);
+        
+        // Modify header flags (response, authoritative)
+        response[2] = 0x84; // Response + Authoritative
+        response[3] = 0x00; // No error
+        
+        // Set answer count to 1
+        response.writeUInt16BE(1, 6);
+        
+        // Add a simple A record response
+        const answerOffset = query.length;
+        response.writeUInt16BE(0xc00c, answerOffset); // Name pointer
+        response.writeUInt16BE(0x0001, answerOffset + 2); // Type A
+        response.writeUInt16BE(0x0001, answerOffset + 4); // Class IN
+        response.writeUInt32BE(300, answerOffset + 6); // TTL 300s
+        response.writeUInt16BE(4, answerOffset + 10); // Data length
+        response.writeUInt32BE(0x0a000001, answerOffset + 12); // IP 10.0.0.1
+
+        return response;
     }
 
-    async stop() {
+    start() {
+        const port = config.honeypots.dns.port;
+        this.server.bind(port);
+        console.log(`🕸️ DNS Honeypot is running at port ${port}`);
+    }
+
+    stop() {
         return new Promise<void>((resolve) => {
             this.server.close(() => {
                 console.log('DNS Honeypot stopped');
