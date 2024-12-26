@@ -1,15 +1,26 @@
 {
-  "name": "DecentralizedHoneypots",
-  "version": "1.0.50",
+  "name": "decentralized-honeypots",
+  "version": "1.0.0",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "bun run --watch src/index.ts"
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "test:traffic": "bun run src/tests/trafficSimulator.ts",
+    "deploy:contract": "bun run src/scripts/deployContract.ts"
   },
   "dependencies": {
-    "elysia": "latest"
+    "axios": "^1.7.9",
+    "dotenv": "^16.3.1",
+    "elysia": "latest",
+    "ethers": "^6.9.0",
+    "emailjs": "^4.0.3",
+    "mongoose": "^8.0.3",
+    "smtp-server": "^3.13.0",
+    "dgram": "^1.0.1"
   },
   "devDependencies": {
-    "bun-types": "latest"
+    "bun-types": "latest",
+    "@types/node": "^20.10.5",
+    "solc": "^0.8.20"
   },
   "module": "src/index.js"
 }
