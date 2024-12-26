@@ -4,6 +4,9 @@ import type { TrafficData } from '../../../types';
 import * as fs from 'fs';
 import * as path from 'path';
 
+// Initialize TensorFlow.js with CPU backend
+tf.setBackend('cpu');
+
 interface ModelVersion {
     version: string;
     timestamp: number;
@@ -26,6 +29,8 @@ export class ModelManager {
     private currentVersion: string;
     private versions: Map<string, ModelVersion>;
     private readonly storageKey = 'ddos-model';
+    private readonly modelsDir = path.join(process.cwd(), 'models');
+    private fullDataset?: { features: tf.Tensor2D, labels: tf.Tensor2D };
 
     private constructor() {
         this.versions = new Map();
@@ -42,13 +47,12 @@ export class ModelManager {
 
     private async loadVersionHistory() {
         try {
-            const modelsDir = path.join(process.cwd(), 'models');
-            const files = fs.readdirSync(modelsDir);
+            const files = fs.readdirSync(this.modelsDir);
             for (const file of files) {
-                if (file.startsWith('model-v') && file.endsWith('-metadata.json')) {
-                    const version = file.split('-v')[1].split('-metadata.json')[0];
-                    const metadataPath = path.join(modelsDir, file);
-                    const versionInfo = JSON.parse(fs.readFileSync(metadataPath, 'utf-8')) as ModelVersion;
+                if (file.startsWith('model-v') && file.endsWith('.json')) {
+                    const version = file.split('-v')[1].split('.json')[0];
+                    const metadataPath = path.join(this.modelsDir, file);
+                    const versionInfo = JSON.parse(fs.readFileSync(metadataPath, 'utf-8')).metadata as ModelVersion;
                     this.versions.set(version, versionInfo);
                     // Update current version if this is newer
                     if (this.compareVersions(version, this.currentVersion) > 0) {
@@ -87,163 +91,275 @@ export class ModelManager {
     }
 
     public async trainNewVersion(hyperparameters?: Partial<ModelVersion['hyperparameters']>) {
-        const nextVersion = this.generateNextVersion();
-        console.log(`\nInitializing training for model version ${nextVersion}...`);
-
-        // Default hyperparameters
-        const params = {
-            learningRate: 0.001,
-            batchSize: 32,
-            epochs: 20,
-            layers: [32, 16, 8],
-            ...hyperparameters
-        };
-
-        console.log('Generating training data...');
-        // Generate training data
-        const trainingData = await this.generateTrainingData();
-        console.log(`Generated ${trainingData.features.shape[0]} training samples`);
-        
-        console.log('Creating model architecture...');
-        // Create and train model
-        const model = this.createModel(params);
-        console.log('Model architecture created');
-
-        console.log('\nStarting model training...');
         try {
-            const { metrics, trainedModel } = await this.trainModel(model, trainingData, params);
+            const nextVersion = this.generateNextVersion();
+            console.log(`\nInitializing training for model version ${nextVersion}...`);
 
-            // Save model with version metadata
-            const versionInfo: ModelVersion = {
-                version: nextVersion,
-                timestamp: Date.now(),
-                metrics,
-                hyperparameters: params
+            // Default hyperparameters
+            const params = {
+                learningRate: 0.001,
+                batchSize: 32,
+                epochs: 20,
+                layers: [32, 16, 8],
+                ...hyperparameters
             };
+            console.log('Using hyperparameters:', JSON.stringify(params, null, 2));
 
-            console.log('Saving model...');
-            await this.saveModel(trainedModel, versionInfo);
-            this.versions.set(nextVersion, versionInfo);
-            this.currentVersion = nextVersion;
+            console.log('\nGenerating training data...');
+            // Generate training data
+            const trainingData = await this.generateTrainingData();
+            if (!trainingData || !trainingData.features || !trainingData.labels) {
+                throw new Error('Failed to generate training data');
+            }
+            console.log('Training data shape:', {
+                features: trainingData.features.shape,
+                labels: trainingData.labels.shape
+            });
+            
+            console.log('\nCreating model architecture...');
+            // Create and train model
+            const model = this.createModel([10], 5, params.layers);
+            if (!model) {
+                throw new Error('Failed to create model');
+            }
+            model.summary();
+            console.log('Model architecture created');
 
-            return versionInfo;
+            console.log('\nStarting model training...');
+            try {
+                const { metrics, trainedModel } = await this.trainModel(model, trainingData, params);
+                console.log('\nTraining completed successfully');
+                console.log('Metrics:', metrics);
+
+                // Save model with version metadata
+                const versionInfo: ModelVersion = {
+                    version: nextVersion,
+                    timestamp: Date.now(),
+                    metrics,
+                    hyperparameters: params
+                };
+
+                console.log('\nSaving model...');
+                await this.saveModel(trainedModel, versionInfo.version);
+                this.versions.set(nextVersion, versionInfo);
+                this.currentVersion = nextVersion;
+
+                console.log('Model saved successfully');
+                return versionInfo;
+            } catch (error) {
+                console.error('Error during model training:', error);
+                throw error;
+            }
         } catch (error) {
-            console.error('Error during model training:', error);
+            console.error('Fatal error in trainNewVersion:', error);
             throw error;
         }
     }
 
-    private createModel(params: ModelVersion['hyperparameters']): tf.LayersModel {
+    private async saveModel(model: tf.LayersModel, version: string): Promise<void> {
+        const modelDir = path.join(this.modelsDir, `model-v${version}`);
+        
+        try {
+            // Ensure directory exists
+            await fs.promises.mkdir(modelDir, { recursive: true });
+            
+            // Save model architecture and weights separately
+            const modelPath = path.join(modelDir, 'model.json');
+            const weightsPath = path.join(modelDir, 'weights.bin');
+            
+            // Convert model to format compatible with tfjs-node
+            const saveFormat = {
+                modelTopology: {
+                    class_name: "Sequential",
+                    config: {
+                        name: "sequential",
+                        layers: model.layers.map(layer => ({
+                            class_name: layer.getClassName(),
+                            config: {
+                                ...layer.getConfig(),
+                                // Remove regularizers from saved config
+                                kernelRegularizer: null,
+                                biasRegularizer: null,
+                                activityRegularizer: null
+                            }
+                        }))
+                    }
+                },
+                format: 'layers-model',
+                generatedBy: 'TensorFlow.js tfjs-layers v4.22.0',
+                convertedBy: null,
+                weightsManifest: [{
+                    paths: ['weights.bin'],
+                    weights: []
+                }]
+            };
+            
+            // Save model architecture
+            await fs.promises.writeFile(modelPath, JSON.stringify(saveFormat, null, 2));
+            
+            // Save weights
+            const weightData = await model.getWeights();
+            const weightSpecs = weightData.map(w => ({
+                name: w.name || '',
+                shape: w.shape,
+                dtype: w.dtype
+            }));
+            
+            // Write weights to binary file
+            const writer = await fs.promises.open(weightsPath, 'w');
+            for (const weight of weightData) {
+                const data = await weight.data();
+                await writer.write(Buffer.from(data.buffer));
+                weight.dispose();
+            }
+            await writer.close();
+            
+            // Update weights manifest
+            saveFormat.weightsManifest[0].weights = weightSpecs;
+            await fs.promises.writeFile(modelPath, JSON.stringify(saveFormat, null, 2));
+            
+            console.log('Model saved successfully');
+        } catch (error) {
+            console.error('Error saving model:', error);
+            throw error;
+        }
+    }
+
+    private async loadModel(version: string): Promise<tf.LayersModel> {
+        const modelDir = path.join(this.modelsDir, `model-v${version}`);
+        const modelPath = `file://${modelDir}/model.json`;
+        
+        try {
+            // Load model using tf.loadLayersModel
+            const model = await tf.loadLayersModel(modelPath);
+            return model;
+        } catch (error) {
+            console.error('Error loading model:', error);
+            throw error;
+        }
+    }
+
+    private createModel(inputShape: number[], numClasses: number, layers: number[]): tf.LayersModel {
         const model = tf.sequential();
 
-        // Input layer
+        // Input layer with correct shape specification
         model.add(tf.layers.dense({
-            units: params.layers[0],
-            activation: 'relu',
-            inputShape: [8] // Number of features
+            units: layers[0],
+            inputShape: inputShape,
+            kernelInitializer: 'glorotNormal',
+            kernelRegularizer: tf.regularizers.l1l2({l1: 0.01, l2: 0.01})
         }));
 
-        // Hidden layers
-        for (let i = 1; i < params.layers.length; i++) {
-            model.add(tf.layers.dropout({ rate: 0.2 }));
+        // Add regularization to prevent overfitting
+        model.add(tf.layers.batchNormalization());
+        model.add(tf.layers.activation({activation: 'relu'}));
+        model.add(tf.layers.dropout({rate: 0.5}));
+
+        // Hidden layers with stronger regularization
+        for (let i = 1; i < layers.length; i++) {
             model.add(tf.layers.dense({
-                units: params.layers[i],
-                activation: 'relu'
+                units: layers[i],
+                kernelInitializer: 'glorotNormal',
+                kernelRegularizer: tf.regularizers.l1l2({l1: 0.01, l2: 0.01})
             }));
+            model.add(tf.layers.batchNormalization());
+            model.add(tf.layers.activation({activation: 'relu'}));
+            model.add(tf.layers.dropout({rate: 0.5}));
         }
 
         // Output layer
         model.add(tf.layers.dense({
-            units: 4, // normal, suspicious, targeted, ddos
-            activation: 'softmax'
+            units: numClasses,
+            activation: 'softmax',
+            kernelInitializer: 'glorotNormal'
         }));
 
+        // Compile with better optimizer settings
         model.compile({
-            optimizer: tf.train.adam(params.learningRate),
+            optimizer: tf.train.adamax(0.0002),  // Use Adamax for better stability
             loss: 'categoricalCrossentropy',
             metrics: ['accuracy']
         });
+
+        // Print model summary
+        console.log('\nModel Summary:');
+        model.summary();
 
         return model;
     }
 
     private async generateTrainingData() {
-        console.log('Generating attack patterns...');
-        const duration = 300000; // 5 minutes per pattern
-        const patterns = ['HTTP_FLOOD', 'DNS_AMPLIFICATION', 'SMTP_BRUTE_FORCE', 'SLOW_LORIS'] as const;
-        const trainingData: Array<{ input: TrafficData, label: string }> = [];
+        try {
+            console.log('Starting training data generation...');
+            const duration = 300000; // 5 minutes per pattern
+            const patterns = ['HTTP_FLOOD', 'DNS_AMPLIFICATION', 'SMTP_BRUTE_FORCE', 'SLOW_LORIS'] as const;
+            const trainingData: Array<{ input: TrafficData, label: string }> = [];
 
-        // Generate attack patterns
-        for (const pattern of patterns) {
-            console.log(`Generating ${pattern} pattern...`);
-            const data = TrafficPatternGenerator.generateTrafficData(pattern, duration);
-            data.forEach(input => {
+            // Generate attack patterns
+            for (const pattern of patterns) {
+                console.log(`\nGenerating ${pattern} pattern...`);
+                const data = TrafficPatternGenerator.generateTrafficData(pattern, duration);
+                console.log(`Generated ${data.length} samples for ${pattern}`);
+                data.forEach(input => {
+                    trainingData.push({
+                        input,
+                        label: pattern
+                    });
+                });
+            }
+
+            // Generate normal traffic
+            console.log('\nGenerating normal traffic pattern...');
+            const normalTraffic = TrafficPatternGenerator.generateMixedTraffic(duration);
+            console.log(`Generated ${normalTraffic.length} samples for normal traffic`);
+            normalTraffic.forEach(input => {
                 trainingData.push({
                     input,
-                    label: this.getLabel(pattern)
+                    label: 'NORMAL'
                 });
             });
-        }
 
-        // Generate normal traffic
-        console.log('Generating normal traffic pattern...');
-        const normalTraffic = TrafficPatternGenerator.generateMixedTraffic(duration);
-        normalTraffic.forEach(input => {
-            trainingData.push({
-                input,
-                label: 'normal'
-            });
-        });
+            console.log('\nPreprocessing training data...');
+            console.log(`Total samples: ${trainingData.length}`);
 
-        console.log('Preprocessing training data...');
-        return this.preprocessTrainingData(trainingData);
-    }
+            // Convert to tensors
+            const features = tf.tensor2d(
+                trainingData.map(sample => this.extractFeatures(sample.input)),
+                [trainingData.length, 10] // Feature dimension
+            );
 
-    private getLabel(pattern: string): string {
-        switch (pattern) {
-            case 'HTTP_FLOOD':
-            case 'DNS_AMPLIFICATION':
-                return 'ddos';
-            case 'SLOW_LORIS':
-                return 'targeted';
-            case 'SMTP_BRUTE_FORCE':
-                return 'suspicious';
-            default:
-                return 'normal';
+            const labels = tf.tensor2d(
+                trainingData.map(sample => this.oneHotEncode(sample.label)),
+                [trainingData.length, 5] // 4 attack types + normal
+            );
+
+            console.log('Data preprocessing completed');
+            return { features, labels };
+        } catch (error) {
+            console.error('Error generating training data:', error);
+            throw error;
         }
     }
 
-    private preprocessTrainingData(data: Array<{ input: TrafficData, label: string }>) {
-        // Convert data to tensors
-        const features = data.map(item => {
-            const { requestCount, timeWindow, uniqueIps } = item.input;
-            const rps = requestCount / (timeWindow / 1000);
-            const uniqueIpsCount = Array.isArray(uniqueIps) ? uniqueIps.length : uniqueIps?.size ?? 1;
-            const ipRatio = requestCount > 0 ? uniqueIpsCount / requestCount : 1;
+    private extractFeatures(data: TrafficData): number[] {
+        // Extract relevant features from traffic data
+        return [
+            data.requestCount,
+            data.timeWindow,
+            data.uniqueIps.size,
+            data.protocol === 'http' ? 1 : 0,
+            data.protocol === 'dns' ? 1 : 0,
+            data.protocol === 'smtp' ? 1 : 0,
+            data.paths ? data.paths.length : 0,
+            data.queryTypes ? 1 : 0,
+            data.timestamp % 86400000, // Time of day
+            1 // Bias term
+        ];
+    }
 
-            return [
-                rps,
-                ipRatio,
-                uniqueIpsCount,
-                requestCount,
-                item.input.protocol === 'http' ? 1 : 0,
-                item.input.protocol === 'dns' ? 1 : 0,
-                item.input.protocol === 'smtp' ? 1 : 0,
-                item.input.paths?.some(p => p.includes('admin') || p.includes('wp-')) ? 1 : 0
-            ];
-        });
-
-        const labels = data.map(item => {
-            const categories = ['normal', 'suspicious', 'targeted', 'ddos'];
-            const oneHot = new Array(categories.length).fill(0);
-            oneHot[categories.indexOf(item.label)] = 1;
-            return oneHot;
-        });
-
-        return {
-            features: tf.tensor2d(features),
-            labels: tf.tensor2d(labels)
-        };
+    private oneHotEncode(label: string): number[] {
+        const labels = ['HTTP_FLOOD', 'DNS_AMPLIFICATION', 'SMTP_BRUTE_FORCE', 'SLOW_LORIS', 'NORMAL'];
+        return labels.map(l => l === label ? 1 : 0);
     }
 
     private async trainModel(
@@ -253,174 +369,253 @@ export class ModelManager {
     ) {
         const { features, labels } = data;
 
-        // Split into training and validation sets
-        const splitIdx = Math.floor(features.shape[0] * 0.8);
-        const trainFeatures = features.slice([0, 0], [splitIdx, -1]);
-        const trainLabels = labels.slice([0, 0], [splitIdx, -1]);
-        const valFeatures = features.slice([splitIdx, 0], [-1, -1]);
-        const valLabels = labels.slice([splitIdx, 0], [-1, -1]);
+        // Validate data shapes
+        const featureShape = features.shape;
+        const labelShape = labels.shape;
+        console.log('\nValidating data shapes:');
+        console.log('Features shape:', featureShape);
+        console.log('Labels shape:', labelShape);
 
-        // Progress tracking
+        if (featureShape[1] !== 10) {
+            throw new Error(`Expected features to have 10 dimensions, but got ${featureShape[1]}`);
+        }
+        if (labelShape[1] !== 5) {
+            throw new Error(`Expected labels to have 5 classes, but got ${labelShape[1]}`);
+        }
+        if (featureShape[0] !== labelShape[0]) {
+            throw new Error(`Number of examples mismatch: features ${featureShape[0]}, labels ${labelShape[0]}`);
+        }
+
+        // Reduce dataset size with balanced sampling
+        const maxSamples = 10000;
+        let trainFeatures, trainLabels, valFeatures, valLabels;
+
+        if (features.shape[0] > maxSamples) {
+            console.log(`\nReducing dataset size with balanced sampling`);
+            
+            // Convert labels to indices
+            const labelIndices = tf.argMax(labels, 1);
+            const labelsArray = await labelIndices.array();
+            labelIndices.dispose();
+
+            // Count samples per class
+            const classCounts = new Array(5).fill(0);
+            labelsArray.forEach(label => classCounts[label]++);
+            console.log('Original class distribution:', classCounts);
+
+            // Find minimum samples per class (at least 100)
+            const minSamplesPerClass = Math.max(100, Math.min(...classCounts));
+            const targetSamplesPerClass = Math.min(minSamplesPerClass, Math.floor(maxSamples / 5));
+            console.log('Target samples per class:', targetSamplesPerClass);
+            
+            // Group indices by class
+            const classIndices = Array.from({ length: 5 }, () => [] as number[]);
+            labelsArray.forEach((label, idx) => {
+                classIndices[label].push(idx);
+            });
+
+            // Sample with replacement for underrepresented classes
+            const selectedIndices: number[] = [];
+            classIndices.forEach((indices, classIdx) => {
+                if (indices.length === 0) {
+                    console.log(`Warning: No samples for class ${classIdx}`);
+                    return;
+                }
+
+                // If we have fewer samples than needed, sample with replacement
+                if (indices.length < targetSamplesPerClass) {
+                    console.log(`Class ${classIdx}: Sampling ${targetSamplesPerClass} with replacement from ${indices.length} samples`);
+                    for (let i = 0; i < targetSamplesPerClass; i++) {
+                        const randomIdx = Math.floor(Math.random() * indices.length);
+                        selectedIndices.push(indices[randomIdx]);
+                    }
+                } else {
+                    // If we have enough samples, sample without replacement
+                    const shuffled = [...indices];
+                    for (let i = shuffled.length - 1; i > 0; i--) {
+                        const j = Math.floor(Math.random() * (i + 1));
+                        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+                    }
+                    selectedIndices.push(...shuffled.slice(0, targetSamplesPerClass));
+                }
+            });
+
+            // Shuffle selected indices
+            for (let i = selectedIndices.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [selectedIndices[i], selectedIndices[j]] = [selectedIndices[j], selectedIndices[i]];
+            }
+
+            // Convert to tensor and gather samples
+            const indicesTensor = tf.tensor1d(selectedIndices, 'int32');
+            const selectedFeatures = tf.gather(features, indicesTensor);
+            const selectedLabels = tf.gather(labels, indicesTensor);
+
+            // Split into training and validation
+            const splitIdx = Math.floor(selectedIndices.length * 0.8);
+            trainFeatures = selectedFeatures.slice([0, 0], [splitIdx, -1]);
+            trainLabels = selectedLabels.slice([0, 0], [splitIdx, -1]);
+            valFeatures = selectedFeatures.slice([splitIdx, 0], [-1, -1]);
+            valLabels = selectedLabels.slice([splitIdx, 0], [-1, -1]);
+
+            // Store full dataset for final validation
+            this.fullDataset = {
+                features: features.clone(),
+                labels: labels.clone()
+            };
+
+            // Cleanup
+            indicesTensor.dispose();
+            selectedFeatures.dispose();
+            selectedLabels.dispose();
+
+            console.log('\nFinal dataset sizes:');
+            console.log('Training samples:', trainFeatures.shape[0]);
+            console.log('Validation samples:', valFeatures.shape[0]);
+            console.log('Full dataset samples:', features.shape[0]);
+        } else {
+            // If dataset is already small enough, use it all
+            const splitIdx = Math.floor(features.shape[0] * 0.8);
+            trainFeatures = features.slice([0, 0], [splitIdx, -1]);
+            trainLabels = labels.slice([0, 0], [splitIdx, -1]);
+            valFeatures = features.slice([splitIdx, 0], [-1, -1]);
+            valLabels = labels.slice([splitIdx, 0], [-1, -1]);
+            
+            this.fullDataset = {
+                features: features.clone(),
+                labels: labels.clone()
+            };
+        }
+
+        // Train model with early stopping and progress tracking
+        console.log('\nStarting training...');
+        let bestValLoss = Infinity;
+        let patience = 5;
+        let patienceCounter = 0;
         let startTime = Date.now();
-        let lastLogTime = startTime;
 
-        // Train model
         const history = await model.fit(trainFeatures, trainLabels, {
-            epochs: params.epochs,
+            epochs: Math.min(params.epochs, 20),
             batchSize: params.batchSize,
             validationData: [valFeatures, valLabels],
+            shuffle: true,
+            verbose: 1,
             callbacks: {
-                onEpochBegin: (epoch) => {
-                    if (epoch === 0) {
-                        console.log('\nStarting training...');
-                        console.log('Epochs:', params.epochs);
-                        console.log('Batch size:', params.batchSize);
-                        console.log('Learning rate:', params.learningRate);
-                        console.log('Training samples:', trainFeatures.shape[0]);
-                        console.log('Validation samples:', valFeatures.shape[0]);
-                        console.log('\nTraining progress:');
-                    }
-                },
-                onEpochEnd: (epoch, logs) => {
-                    const currentTime = Date.now();
-                    const elapsedMinutes = ((currentTime - startTime) / 1000 / 60).toFixed(1);
-                    const epochsRemaining = params.epochs - (epoch + 1);
-                    const timePerEpoch = (currentTime - startTime) / (epoch + 1);
-                    const estimatedTimeRemaining = ((epochsRemaining * timePerEpoch) / 1000 / 60).toFixed(1);
+                onEpochEnd: async (epoch, logs) => {
+                    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                    console.log(
+                        `Epoch ${epoch + 1}/${Math.min(params.epochs, 20)} - ` +
+                        `loss: ${logs.loss.toFixed(4)} - ` +
+                        `accuracy: ${logs.acc.toFixed(4)} - ` +
+                        `val_loss: ${logs.val_loss.toFixed(4)} - ` +
+                        `val_accuracy: ${logs.val_acc.toFixed(4)} - ` +
+                        `time: ${elapsed}s`
+                    );
 
-                    // Log every 5 epochs or if more than 30 seconds passed
-                    if (epoch % 5 === 0 || currentTime - lastLogTime > 30000) {
-                        console.log(
-                            `Epoch ${epoch + 1}/${params.epochs} - ` +
-                            `loss: ${logs?.loss.toFixed(4)} - ` +
-                            `accuracy: ${logs?.acc.toFixed(4)} - ` +
-                            `val_loss: ${logs?.val_loss.toFixed(4)} - ` +
-                            `val_accuracy: ${logs?.val_acc.toFixed(4)}`
-                        );
-                        console.log(
-                            `Time elapsed: ${elapsedMinutes}m - ` +
-                            `Estimated time remaining: ${estimatedTimeRemaining}m`
-                        );
-                        lastLogTime = currentTime;
-                    }
-
-                    // Early stopping if validation loss is not improving
-                    if (epoch > 10 && logs?.val_loss > 1.0) {
-                        console.log('\nStopping early due to high validation loss');
-                        model.stopTraining = true;
+                    // Early stopping
+                    if (logs.val_loss < bestValLoss) {
+                        bestValLoss = logs.val_loss;
+                        patienceCounter = 0;
+                    } else {
+                        patienceCounter++;
+                        if (patienceCounter >= patience) {
+                            console.log('\nStopping early due to no improvement in validation loss');
+                            model.stopTraining = true;
+                        }
                     }
                 }
             }
         });
 
-        // Calculate metrics
-        console.log('\nCalculating final metrics...');
-        const evaluation = await model.evaluate(valFeatures, valLabels) as tf.Scalar[];
-        const predictions = model.predict(valFeatures) as tf.Tensor;
-        const metrics = this.calculateMetrics(valLabels, predictions);
+        // Calculate metrics on validation set
+        console.log('\nCalculating validation metrics...');
+        const valPredictions = model.predict(valFeatures) as tf.Tensor;
+        const valMetrics = this.calculateMetrics(valLabels, valPredictions);
+        valPredictions.dispose();
 
-        console.log('\nTraining completed!');
-        console.log('Final metrics:');
-        console.log('- Accuracy:', metrics.accuracy.toFixed(4));
-        console.log('- Precision:', metrics.precision.toFixed(4));
-        console.log('- Recall:', metrics.recall.toFixed(4));
-        console.log('- F1 Score:', metrics.f1Score.toFixed(4));
-        console.log(`Total training time: ${((Date.now() - startTime) / 1000 / 60).toFixed(1)} minutes`);
+        // Calculate metrics on full dataset
+        console.log('\nCalculating metrics on full dataset...');
+        const fullPredictions = model.predict(this.fullDataset.features) as tf.Tensor;
+        const fullMetrics = this.calculateMetrics(this.fullDataset.labels, fullPredictions);
+        
+        console.log('\nValidation set metrics:', valMetrics);
+        console.log('Full dataset metrics:', fullMetrics);
 
         // Cleanup
-        features.dispose();
-        labels.dispose();
         trainFeatures.dispose();
         trainLabels.dispose();
         valFeatures.dispose();
         valLabels.dispose();
-        predictions.dispose();
+        fullPredictions.dispose();
+        this.fullDataset.features.dispose();
+        this.fullDataset.labels.dispose();
 
         return {
-            metrics,
+            metrics: fullMetrics,
             trainedModel: model
         };
     }
 
-    private calculateMetrics(actual: tf.Tensor2D, predicted: tf.Tensor): ModelVersion['metrics'] {
-        const actualArray = actual.arraySync() as number[][];
-        const predictedArray = predicted.arraySync() as number[][];
-
-        let tp = 0, fp = 0, fn = 0;
-        let correct = 0;
-        const total = actualArray.length;
-
-        for (let i = 0; i < total; i++) {
-            const actualClass = actualArray[i].indexOf(1);
-            const predictedClass = predictedArray[i].indexOf(Math.max(...predictedArray[i]));
-
-            if (actualClass === predictedClass) {
-                correct++;
-                if (actualClass !== 0) tp++; // Not normal class
-            } else {
-                if (predictedClass !== 0) fp++; // False positive
-                if (actualClass !== 0) fn++; // False negative
-            }
-        }
-
-        const accuracy = correct / total;
-        const precision = tp / (tp + fp) || 0;
-        const recall = tp / (tp + fn) || 0;
-        const f1Score = 2 * (precision * recall) / (precision + recall) || 0;
-
-        return {
-            accuracy,
-            precision,
-            recall,
-            f1Score
-        };
-    }
-
-    private async saveModel(model: tf.LayersModel, versionInfo: ModelVersion) {
+    private calculateMetrics(actual: tf.Tensor, predicted: tf.Tensor): ModelVersion['metrics'] {
         try {
-            // Create models directory if it doesn't exist
-            const modelsDir = path.join(process.cwd(), 'models');
-            if (!fs.existsSync(modelsDir)) {
-                fs.mkdirSync(modelsDir, { recursive: true });
-            }
-
-            // Save model files
-            const modelPath = path.join(modelsDir, `model-v${versionInfo.version}`);
-            await model.save(`file://${modelPath}`);
-
-            // Save version metadata
-            const metadataPath = path.join(modelsDir, `model-v${versionInfo.version}-metadata.json`);
-            fs.writeFileSync(metadataPath, JSON.stringify(versionInfo, null, 2));
-
-            console.log(`Model version ${versionInfo.version} saved successfully to ${modelPath}`);
-            console.log(`Model metadata saved to ${metadataPath}`);
-        } catch (error) {
-            console.error('Error saving model:', error);
-            throw error;
-        }
-    }
-
-    private async loadModel(version?: string): Promise<{ model: tf.LayersModel, versionInfo: ModelVersion }> {
-        try {
-            const targetVersion = version || this.currentVersion;
-            if (!targetVersion) {
-                throw new Error('No model version specified and no current version set');
-            }
-
-            const modelsDir = path.join(process.cwd(), 'models');
-            const modelPath = path.join(modelsDir, `model-v${targetVersion}`);
-            const metadataPath = path.join(modelsDir, `model-v${targetVersion}-metadata.json`);
-
-            // Load model
-            const model = await tf.loadLayersModel(`file://${modelPath}/model.json`);
+            // Convert predictions to class indices
+            const predictedClasses = predicted.argMax(-1);
+            const actualClasses = actual.argMax(-1);
             
-            // Load metadata
-            const versionInfo = JSON.parse(fs.readFileSync(metadataPath, 'utf-8')) as ModelVersion;
+            // Calculate accuracy
+            const correct = predictedClasses.equal(actualClasses);
+            const accuracy = correct.mean().dataSync()[0];
 
-            console.log(`Model version ${targetVersion} loaded successfully from ${modelPath}`);
-            return { model, versionInfo };
+            // Calculate per-class metrics
+            const confusionMatrix = Array(5).fill(0).map(() => Array(5).fill(0));
+            const predArray = predictedClasses.arraySync() as number[];
+            const actualArray = actualClasses.arraySync() as number[];
+
+            // Build confusion matrix
+            for (let i = 0; i < predArray.length; i++) {
+                confusionMatrix[actualArray[i]][predArray[i]]++;
+            }
+
+            // Calculate precision, recall for each class
+            let totalPrecision = 0;
+            let totalRecall = 0;
+            let validClasses = 0;
+
+            for (let i = 0; i < 5; i++) {
+                const truePositives = confusionMatrix[i][i];
+                const falsePositives = confusionMatrix.reduce((sum, row, idx) => 
+                    idx !== i ? sum + row[i] : sum, 0);
+                const falseNegatives = confusionMatrix[i].reduce((sum, val, idx) => 
+                    idx !== i ? sum + val : sum, 0);
+
+                if (truePositives + falsePositives > 0 && truePositives + falseNegatives > 0) {
+                    const precision = truePositives / (truePositives + falsePositives);
+                    const recall = truePositives / (truePositives + falseNegatives);
+                    totalPrecision += precision;
+                    totalRecall += recall;
+                    validClasses++;
+                }
+            }
+
+            // Calculate macro-averaged metrics
+            const precision = validClasses > 0 ? totalPrecision / validClasses : 0;
+            const recall = validClasses > 0 ? totalRecall / validClasses : 0;
+            const f1Score = precision + recall > 0 
+                ? 2 * (precision * recall) / (precision + recall)
+                : 0;
+
+            // Cleanup
+            predictedClasses.dispose();
+            actualClasses.dispose();
+
+            return {
+                accuracy,
+                precision,
+                recall,
+                f1Score
+            };
         } catch (error) {
-            console.error('Error loading model:', error);
+            console.error('Error calculating metrics:', error);
             throw error;
         }
     }

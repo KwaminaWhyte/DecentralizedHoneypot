@@ -1,5 +1,6 @@
 import { ModelManager } from './modelManager';
 import { TrafficPatternGenerator } from '../../traffic/patterns';
+import * as tf from '@tensorflow/tfjs';
 
 async function main() {
     try {
